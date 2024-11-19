@@ -1,81 +1,90 @@
-const configuration = {'iceServers': [{'urls': 'stun:stun.l.google.com:19302'}]}
-const peerConnection = new RTCPeerConnection(configuration);
 const signalingChannel = new WebSocket("ws://localhost:8765");
+var pc = null;
 
-async function attachTracks(){
-    const localStream = await navigator.mediaDevices.getUserMedia({video: true, audio: true});
-    localStream.getTracks().forEach(track => {
-        if(track.kind==="video"){ peerConnection.addTrack(track, localStream); }
+function createPeerConnection(){
+    var config = {'iceServers': [{'urls': 'stun:stun.l.google.com:19302'}]}
+    pc = new RTCPeerConnection(config);
+    
+    // register some listeners to help debugging
+    pc.addEventListener('icegatheringstatechange', () => {
+        console.log("[GATHERING STATE]"+pc.iceGatheringState);
     });
+
+    pc.addEventListener('iceconnectionstatechange', () => {
+        console.log("[CONNECTION STATE]"+pc.iceConnectionState)
+    });
+
+    pc.addEventListener('signalingstatechange', () => {
+        console.log("[SIGNALING STATE]"+pc.signalingState)
+    });
+    
+    return pc;
+}
+
+async function waitForSignalingChannel(){
+    if(signalingChannel.readyState===WebSocket.OPEN){
+        return;
+    }
+    await new Promise((resolve)=>{
+        signalingChannel.addEventListener('open', resolve);
+    })
+}
+
+async function waitForIceGatheringComplete(){
+    if (pc.iceGatheringState === 'complete'){
+        return;
+    }
+    await new Promise ((resolve) => {
+        function checkState(){
+            if(pc.iceGatheringState === 'complete'){
+                pc.removeEventListener('icegatheringstatechange', checkState);
+                resolve();
+            }
+        }
+        pc.addEventListener('icegatheringstatechange', checkState)
+    })
 }
 
 async function makeCall(){
     // javascript should create the offer 
-    const offer = await peerConnection.createOffer();
-    await peerConnection.setLocalDescription(offer);
-    await signalingChannel.send(JSON.stringify({'offer': offer}));
+    var constraints = {
+        audio: false,
+        video: true
+    }
+    var localStream = await navigator.mediaDevices.getUserMedia(constraints);
+    localStream.getTracks().forEach((track)=>{
+        if(track.kind==="video"){
+            pc.addTrack(track, localStream);
+        }
+    })
+    var offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    
+    // need to wait until ice gathering state is complete
+    await waitForIceGatheringComplete()
+
+    offer = pc.localDescription;
+    
+    
+    // now i need to send the offer over the signaling channel
+    signalingChannel.send(JSON.stringify({
+            'sdp': offer.sdp,
+            'type': offer.type
+        }
+    ))
 }
 
-signalingChannel.addEventListener('open', async () => {
-    // Once the signaling channel is open, we can proceed
-    await attachTracks();
-    await makeCall();
-});
 
 signalingChannel.addEventListener('message', async message => {
     answer = JSON.parse(message.data)
-    if (answer["type"]==="answer") {
-        const remoteDesc = new RTCSessionDescription({
-            type: answer.type,
-            sdp: answer.sdp
-        });
-        await peerConnection.setRemoteDescription(remoteDesc);
-    }
-});
-
-peerConnection.addEventListener('connectionstatechange', event => {
-    console.log(peerConnection.connectionState)
-    if (peerConnection.connectionState === 'connected') {
-        // Peers connected
-        
-    }
-});
-
-peerConnection.addEventListener('icegatheringstatechange', event =>{
-    console.log(peerConnection.iceConnectionState)
-})
-
-peerConnection.addEventListener('icecandidate', event => {
-    if (event.candidate && event.candidate.candidate!="") {
-        // Send the candidate data as JSON
-        signalingChannel.send(JSON.stringify({
-            'new-ice-candidate': {
-                'sdpMid': event.candidate.sdpMid,
-                'component': event.candidate.component,
-                'foundation': event.candidate.foundation,
-                'address': event.candidate.address,
-                'port': event.candidate.port,
-                'priority': event.candidate.priority,
-                'protocol': event.candidate.protocol,
-                'type': event.candidate.type,
-                'relatedAddress': event.candidate.relatedAddress,
-                'relatedPort': event.candidate.relatedPort,
-                'sdpMLineIndex': event.candidate.sdpMLineIndex,
-                'tcpType': event.candidate.tcpType
-            }
-        }));
-    }
-});
-
-// Listen for remote ICE candidates and add them to the local RTCPeerConnection
-signalingChannel.addEventListener('message', async message => {
-    if (message.iceCandidate) {
-        try {
-            await peerConnection.addIceCandidate(message.iceCandidate);
-        } catch (e) {
-            console.error('Error adding received ice candidate', e);
-        }
-    }
+    var remoteDesc = new RTCSessionDescription({
+        type: answer.type,
+        sdp: answer.sdp
+    });
+    await pc.setRemoteDescription(remoteDesc);
 });
 
 
+waitForSignalingChannel()
+pc = createPeerConnection();
+makeCall();

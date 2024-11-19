@@ -1,57 +1,58 @@
 import json
 import asyncio
+import aiortc.contrib
+import aiortc.contrib.media
 import websockets
 import aiortc 
 
-async def connect(websocket):
-    config = aiortc.RTCConfiguration([aiortc.RTCIceServer('stun:stun.l.google.com:19302')])
-    pc = aiortc.RTCPeerConnection(configuration=config)
+relay = aiortc.contrib.media.MediaRelay()
+pcs = set()
 
-    # Monitor connection state changes
-    @pc.on("connectionstatechange")
-    async def on_connection_state_change():
-        print(f"Connection state is {pc.connectionState}")
-    
+class VideoStreamTrack(aiortc.MediaStreamTrack):
+    kind='video'    # è obbligatorio fare questo, wow
+    def __init__(self, track):
+        super().__init__()  
+        self.track = track
+
+    async def recv(self):
+        frame = await self.track.recv()
+        print(frame)
+        return frame
+
+async def receiveOffer(websocket):
     try:
         async for message in websocket:
-            data = json.loads(message)
+            print("[OFFER RECEIVED]")
 
-            if 'new-ice-candidate' in data:
-                candidate_info = data['new-ice-candidate']
-                ice_candidate = aiortc.RTCIceCandidate(
-                    component = candidate_info['component'],
-                    foundation = candidate_info['foundation'],
-                    ip=candidate_info['address'],
-                    port=candidate_info['port'],
-                    priority=candidate_info['priority'],
-                    protocol=candidate_info['protocol'],
-                    type=candidate_info['type'],
-                    relatedAddress=candidate_info['relatedAddress'],
-                    relatedPort=candidate_info['relatedPort'],
-                    sdpMid=candidate_info['sdpMid'],
-                    sdpMLineIndex=candidate_info['sdpMLineIndex'],
-                    tcpType=candidate_info['tcpType']
-                )
-                await pc.addIceCandidate(ice_candidate)
-                print("[ICE CANDIDATE ADDED]")
+            json_offer = json.loads(message)
+            offer = aiortc.RTCSessionDescription(sdp=json_offer['sdp'], type=json_offer['type'])
+            pc = aiortc.RTCPeerConnection()
+            pcs.add(pc)
 
-            if 'offer' in data:
-                print("[OFFER ARRIVED]")
-                offer = data['offer']
+            @pc.on("track")
+            def on_track(track):
+                print("Track received: "+track.kind)
+                if track.kind=='video':
+                    pc.addTrack(VideoStreamTrack(relay.subscribe(track)))
 
-                offer = aiortc.RTCSessionDescription(sdp=offer['sdp'], type=offer['type'])
-                await pc.setRemoteDescription(offer)
+            @pc.on("connectionstatechange")
+            async def on_connectionstatechange():
+                print("Connection state is: "+str(pc.connectionState))
+                if pc.connectionState == "failed":
+                    await pc.close()
+                    pcs.discard(pc)
 
-                answer = await pc.createAnswer()
-                await pc.setLocalDescription(answer)
+            # handle offer
+            await pc.setRemoteDescription(offer)
+            answer = await pc.createAnswer()
+            await pc.setLocalDescription(answer)
 
-                print("[SENDING BACK ANSWER]")
-                await websocket.send(json.dumps({
-                    'type': answer.type,
-                    'sdp': answer.sdp,
-                }))
-                
-                
+            await websocket.send(json.dumps({
+                'type': answer.type,
+                'sdp': answer.sdp
+            }))
+            print("[ANSWER SENT]")
+
 
     except websockets.exceptions.ConnectionClosed as e:
         print(f"Connection closed: {e}")
@@ -59,9 +60,15 @@ async def connect(websocket):
     finally:
         await pc.close()
 
+async def on_shutdown():
+    coros = [pc.close() for pc in pcs]
+    await asyncio.gather(*coros)
+    pcs.clear()
+
 async def main():
-    server = await websockets.serve(connect, "localhost", 8765)
+    server = await websockets.serve(receiveOffer, "localhost", 8765)
     print("WebSocket server is running on ws://localhost:8765")
     await server.wait_closed()
+    await on_shutdown()
 
 asyncio.run(main())
